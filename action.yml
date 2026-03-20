@@ -1,0 +1,187 @@
+name: 'capsec audit'
+description: 'Static capability audit for Rust crates — detect ambient authority (filesystem, network, env, process, FFI) in your code'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  version:
+    description: 'Version of cargo-capsec to install (e.g. "0.1.0" or "latest")'
+    default: 'latest'
+  fail-on:
+    description: 'Minimum risk level to fail on: low, medium, high, critical'
+    default: 'high'
+  baseline:
+    description: 'Path to baseline file. Set to empty string to disable baseline diffing.'
+    default: '.capsec-baseline.json'
+  diff:
+    description: 'Only fail on new findings vs baseline (auto-enabled on pull_request events)'
+    default: 'auto'
+  format:
+    description: 'Output format: text, json, sarif'
+    default: 'sarif'
+  upload-sarif:
+    description: 'Upload SARIF to GitHub Code Scanning (requires security-events: write)'
+    default: 'true'
+  comment-on-pr:
+    description: 'Post findings as inline PR review comments via reviewdog'
+    default: 'true'
+  working-directory:
+    description: 'Path to Cargo workspace root'
+    default: '.'
+  token:
+    description: 'GitHub token for PR comments and SARIF upload'
+    default: ${{ github.token }}
+  reviewdog-version:
+    description: 'Version of reviewdog to install'
+    default: 'latest'
+  install-from:
+    description: 'Install method: "crates-io" (cargo install) or "git" (from repository)'
+    default: 'crates-io'
+  git-repo:
+    description: 'Git repository URL when install-from is "git"'
+    default: 'https://github.com/bordumb/capsec'
+
+outputs:
+  sarif-file:
+    description: 'Path to generated SARIF file (if format is sarif)'
+    value: ${{ steps.audit.outputs.sarif-file }}
+  finding-count:
+    description: 'Total number of findings'
+    value: ${{ steps.audit.outputs.finding-count }}
+  exit-code:
+    description: 'Exit code from cargo capsec audit (0=pass, 1=findings exceed threshold, 2=error)'
+    value: ${{ steps.audit.outputs.exit-code }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: |
+        if ! command -v cargo &>/dev/null; then
+          echo "::error::Rust toolchain not found. Add dtolnay/rust-toolchain or actions-rust-lang/setup-rust-toolchain before this action."
+          exit 1
+        fi
+
+    - name: Install cargo-capsec
+      shell: bash
+      run: |
+        if command -v cargo-capsec &>/dev/null; then
+          echo "cargo-capsec already installed: $(cargo-capsec capsec audit --help 2>&1 | head -1 || echo 'found')"
+          exit 0
+        fi
+
+        if [ "${{ inputs.install-from }}" = "git" ]; then
+          echo "Installing cargo-capsec from git: ${{ inputs.git-repo }}"
+          cargo install --git "${{ inputs.git-repo }}" cargo-capsec
+        else
+          if [ "${{ inputs.version }}" = "latest" ]; then
+            echo "Installing latest cargo-capsec from crates.io"
+            cargo install cargo-capsec
+          else
+            echo "Installing cargo-capsec v${{ inputs.version }} from crates.io"
+            cargo install cargo-capsec --version "${{ inputs.version }}"
+          fi
+        fi
+
+    - name: Run capsec audit
+      id: audit
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        SARIF_FILE="${RUNNER_TEMP:-/tmp}/capsec-results.sarif"
+        AUDIT_ARGS="--format sarif --fail-on ${{ inputs.fail-on }}"
+
+        # Determine if we should diff against baseline
+        USE_DIFF="false"
+        if [ "${{ inputs.diff }}" = "true" ]; then
+          USE_DIFF="true"
+        elif [ "${{ inputs.diff }}" = "auto" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+          USE_DIFF="true"
+        fi
+
+        # Handle baseline
+        BASELINE_PATH="${{ inputs.baseline }}"
+        if [ "$USE_DIFF" = "true" ] && [ -n "$BASELINE_PATH" ]; then
+          # Fetch baseline from base branch for accurate diffing
+          BASE_BASELINE="${RUNNER_TEMP:-/tmp}/capsec-base-baseline.json"
+          if git show "origin/${{ github.base_ref }}:${BASELINE_PATH}" > "$BASE_BASELINE" 2>/dev/null; then
+            echo "Using baseline from base branch: ${{ github.base_ref }}"
+            AUDIT_ARGS="$AUDIT_ARGS --diff --baseline"
+          else
+            echo "No baseline found on base branch, running full audit"
+          fi
+        fi
+
+        echo "Running: cargo capsec audit $AUDIT_ARGS"
+        set +e
+        cargo capsec audit $AUDIT_ARGS > "$SARIF_FILE" 2>/dev/null
+        AUDIT_EXIT=$?
+        set -e
+
+        # Count findings from SARIF
+        if [ -f "$SARIF_FILE" ] && command -v python3 &>/dev/null; then
+          FINDING_COUNT=$(python3 -c "import json,sys; d=json.load(open('$SARIF_FILE')); print(len(d.get('runs',[{}])[0].get('results',[])))" 2>/dev/null || echo "unknown")
+        else
+          FINDING_COUNT="unknown"
+        fi
+
+        echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
+        echo "finding-count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$AUDIT_EXIT" >> "$GITHUB_OUTPUT"
+
+        if [ "$AUDIT_EXIT" -eq 2 ]; then
+          echo "::error::cargo capsec audit failed with a runtime error (exit code 2)"
+          exit 1
+        fi
+
+        echo "Audit complete: $FINDING_COUNT findings (exit code $AUDIT_EXIT)"
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: inputs.upload-sarif == 'true' && steps.audit.outputs.sarif-file != '' && always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.audit.outputs.sarif-file }}
+        category: capsec
+      continue-on-error: true
+
+    - name: Install reviewdog
+      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh | sh -s -- -b "${RUNNER_TEMP:-/tmp}/bin" "${{ inputs.reviewdog-version }}"
+        echo "${RUNNER_TEMP:-/tmp}/bin" >> "$GITHUB_PATH"
+
+    - name: Post PR review comments
+      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        REVIEWDOG_GITHUB_API_TOKEN: ${{ inputs.token }}
+      run: |
+        SARIF_FILE="${{ steps.audit.outputs.sarif-file }}"
+        if [ ! -f "$SARIF_FILE" ]; then
+          echo "No SARIF file found, skipping PR comments"
+          exit 0
+        fi
+
+        # Convert SARIF to reviewdog format and post
+        # reviewdog supports SARIF input natively via -f=sarif
+        cat "$SARIF_FILE" | reviewdog \
+          -f=sarif \
+          -name="capsec" \
+          -reporter=github-pr-review \
+          -filter-mode=nofilter \
+          -fail-on-error=false \
+          -level=warning
+      continue-on-error: true
+
+    - name: Set check result
+      if: always()
+      shell: bash
+      run: |
+        EXIT_CODE="${{ steps.audit.outputs.exit-code }}"
+        if [ "$EXIT_CODE" = "1" ]; then
+          echo "::warning::capsec audit found findings exceeding the '${{ inputs.fail-on }}' threshold"
+          exit 1
+        fi
