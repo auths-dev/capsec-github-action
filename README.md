@@ -66,13 +66,12 @@ jobs:
     diff: 'true'
 ```
 
-### Install from git (before crates.io publish)
+### Pin a specific version
 
 ```yaml
 - uses: capsec/audit-action@v1
   with:
-    install-from: git
-    git-repo: https://github.com/bordumb/capsec
+    version: '0.1.0'
 ```
 
 ### Monorepo with custom working directory
@@ -93,7 +92,7 @@ jobs:
 
 ## How it works
 
-1. Installs `cargo-capsec` (from crates.io or git)
+1. Installs `cargo-capsec` from crates.io
 2. Runs `cargo capsec audit --format sarif --fail-on <threshold>`
 3. Uploads SARIF to GitHub Code Scanning (appears in Security tab)
 4. Posts inline review comments on PR diffs via reviewdog
