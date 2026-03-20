@@ -143,7 +143,7 @@ runs:
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: ${{ steps.audit.outputs.sarif-file }}
-        category: capsec
+        category: capsec-audit
       continue-on-error: true
 
     - name: Install reviewdog
