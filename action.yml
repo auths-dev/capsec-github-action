@@ -41,6 +41,9 @@ inputs:
   skip:
     description: 'Skip these crates (comma-separated). Maps to --skip flag.'
     default: ''
+  sarif-category:
+    description: 'SARIF category for Code Scanning (must be unique if action is called multiple times in one job)'
+    default: 'capsec-audit'
   install-from:
     description: 'Install method: "crates-io" (cargo install) or "git" (from repository)'
     default: 'crates-io'
@@ -72,63 +75,93 @@ runs:
 
     - name: Install cargo-capsec
       shell: bash
+      env:
+        INPUT_INSTALL_FROM: ${{ inputs.install-from }}
+        INPUT_VERSION: ${{ inputs.version }}
+        INPUT_GIT_REPO: ${{ inputs.git-repo }}
       run: |
         if command -v cargo-capsec &>/dev/null; then
-          echo "cargo-capsec already installed: $(cargo-capsec capsec audit --help 2>&1 | head -1 || echo 'found')"
+          echo "cargo-capsec already installed"
           exit 0
         fi
 
-        if [ "${{ inputs.install-from }}" = "git" ]; then
-          echo "Installing cargo-capsec from git: ${{ inputs.git-repo }}"
-          cargo install --git "${{ inputs.git-repo }}" cargo-capsec
-        else
-          if [ "${{ inputs.version }}" = "latest" ]; then
-            echo "Installing latest cargo-capsec from crates.io"
-            cargo install cargo-capsec
-          else
-            echo "Installing cargo-capsec v${{ inputs.version }} from crates.io"
-            cargo install cargo-capsec --version "${{ inputs.version }}"
-          fi
-        fi
+        case "$INPUT_INSTALL_FROM" in
+          git)
+            echo "Installing cargo-capsec from git: $INPUT_GIT_REPO"
+            cargo install --git "$INPUT_GIT_REPO" cargo-capsec
+            ;;
+          crates-io)
+            if [ "$INPUT_VERSION" = "latest" ]; then
+              echo "Installing latest cargo-capsec from crates.io"
+              cargo install cargo-capsec
+            else
+              echo "Installing cargo-capsec v$INPUT_VERSION from crates.io"
+              cargo install cargo-capsec --version "$INPUT_VERSION"
+            fi
+            ;;
+          *)
+            echo "::error::Invalid install-from value: $INPUT_INSTALL_FROM. Must be 'crates-io' or 'git'."
+            exit 1
+            ;;
+        esac
 
     - name: Run capsec audit
       id: audit
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_ONLY: ${{ inputs.only }}
+        INPUT_SKIP: ${{ inputs.skip }}
+        INPUT_DIFF: ${{ inputs.diff }}
+        INPUT_BASELINE: ${{ inputs.baseline }}
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_REF: ${{ github.base_ref }}
       run: |
-        SARIF_FILE="${RUNNER_TEMP:-/tmp}/capsec-results.sarif"
-        AUDIT_ARGS="--format sarif --fail-on ${{ inputs.fail-on }}"
+        set -uo pipefail
 
-        # Crate filtering
-        if [ -n "${{ inputs.only }}" ]; then
-          AUDIT_ARGS="$AUDIT_ARGS --only ${{ inputs.only }}"
+        # Validate fail-on
+        case "$INPUT_FAIL_ON" in
+          low|medium|high|critical) ;;
+          *) echo "::error::Invalid fail-on value: $INPUT_FAIL_ON. Must be low, medium, high, or critical."; exit 1 ;;
+        esac
+
+        # Unique SARIF file per invocation to prevent overwrite on dual calls
+        SARIF_FILE="${RUNNER_TEMP:-/tmp}/capsec-results-$$.sarif"
+        STDERR_LOG="${RUNNER_TEMP:-/tmp}/capsec-stderr-$$.log"
+
+        # Build args as array for safe quoting
+        AUDIT_ARGS=(--format sarif --fail-on "$INPUT_FAIL_ON")
+
+        if [ -n "$INPUT_ONLY" ]; then
+          AUDIT_ARGS+=(--only "$INPUT_ONLY")
         fi
-        if [ -n "${{ inputs.skip }}" ]; then
-          AUDIT_ARGS="$AUDIT_ARGS --skip ${{ inputs.skip }}"
+        if [ -n "$INPUT_SKIP" ]; then
+          AUDIT_ARGS+=(--skip "$INPUT_SKIP")
         fi
 
         # Determine if we should diff against baseline
         USE_DIFF="false"
-        if [ "${{ inputs.diff }}" = "true" ]; then
+        if [ "$INPUT_DIFF" = "true" ]; then
           USE_DIFF="true"
-        elif [ "${{ inputs.diff }}" = "auto" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+        elif [ "$INPUT_DIFF" = "auto" ] && [ "$EVENT_NAME" = "pull_request" ]; then
           USE_DIFF="true"
         fi
 
         # Handle baseline
-        BASELINE_PATH="${{ inputs.baseline }}"
         HAVE_BASELINE="false"
-        if [ "$USE_DIFF" = "true" ] && [ -n "$BASELINE_PATH" ]; then
-          # Fetch baseline from base branch for accurate diffing
-          BASE_BASELINE="${RUNNER_TEMP:-/tmp}/capsec-base-baseline.json"
-          if git show "origin/${{ github.base_ref }}:${BASELINE_PATH}" > "$BASE_BASELINE" 2>/dev/null; then
-            echo "Using baseline from base branch: ${{ github.base_ref }}"
-            cp "$BASE_BASELINE" "$BASELINE_PATH"
-            AUDIT_ARGS="$AUDIT_ARGS --diff"
+        if [ "$USE_DIFF" = "true" ] && [ -n "$INPUT_BASELINE" ]; then
+          # Copy baseline to a temp location so we don't modify the working tree
+          EFFECTIVE_BASELINE="${RUNNER_TEMP:-/tmp}/capsec-effective-baseline-$$.json"
+
+          if [ -n "$BASE_REF" ] && git show "origin/${BASE_REF}:${INPUT_BASELINE}" > "$EFFECTIVE_BASELINE" 2>/dev/null; then
+            echo "Using baseline from base branch: $BASE_REF"
+            cp "$EFFECTIVE_BASELINE" "$INPUT_BASELINE"
+            AUDIT_ARGS+=(--diff)
             HAVE_BASELINE="true"
-          elif [ -f "$BASELINE_PATH" ]; then
+          elif [ -f "$INPUT_BASELINE" ]; then
             echo "Using baseline from current branch (not found on base branch)"
-            AUDIT_ARGS="$AUDIT_ARGS --diff"
+            AUDIT_ARGS+=(--diff)
             HAVE_BASELINE="true"
           else
             echo "No baseline found — skipping diff, running informational audit"
@@ -136,54 +169,70 @@ runs:
           fi
         fi
 
-        echo "Running: cargo capsec audit $AUDIT_ARGS"
+        echo "Running: cargo capsec audit ${AUDIT_ARGS[*]}"
         set +e
-        cargo capsec audit $AUDIT_ARGS > "$SARIF_FILE" 2>/dev/null
+        cargo capsec audit "${AUDIT_ARGS[@]}" > "$SARIF_FILE" 2>"$STDERR_LOG"
         AUDIT_EXIT=$?
         set -e
 
         # Count findings from SARIF
-        if [ -f "$SARIF_FILE" ] && command -v python3 &>/dev/null; then
+        if [ -f "$SARIF_FILE" ] && command -v jq &>/dev/null; then
+          FINDING_COUNT=$(jq '.runs[0].results | length' "$SARIF_FILE" 2>/dev/null || echo "unknown")
+        elif [ -f "$SARIF_FILE" ] && command -v python3 &>/dev/null; then
           FINDING_COUNT=$(python3 -c "import json,sys; d=json.load(open('$SARIF_FILE')); print(len(d.get('runs',[{}])[0].get('results',[])))" 2>/dev/null || echo "unknown")
         else
           FINDING_COUNT="unknown"
         fi
 
-        echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
-        echo "finding-count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
-        echo "exit-code=$AUDIT_EXIT" >> "$GITHUB_OUTPUT"
+        # Set all outputs once
+        FINAL_EXIT="$AUDIT_EXIT"
 
         if [ "$AUDIT_EXIT" -eq 2 ]; then
+          echo "::group::capsec audit stderr"
+          cat "$STDERR_LOG" >&2
+          echo "::endgroup::"
           echo "::error::cargo capsec audit failed with a runtime error (exit code 2)"
-          exit 1
         fi
 
         # If diff was requested but no baseline exists, treat as informational (don't fail)
         if [ "$USE_DIFF" = "true" ] && [ "$HAVE_BASELINE" = "false" ] && [ "$AUDIT_EXIT" -eq 1 ]; then
           echo "::notice::Audit found $FINDING_COUNT findings but no baseline exists for diffing. Not failing — commit a baseline to enable regression detection."
-          AUDIT_EXIT=0
-          echo "exit-code=0" >> "$GITHUB_OUTPUT"
+          FINAL_EXIT=0
         fi
 
-        echo "Audit complete: $FINDING_COUNT findings (exit code $AUDIT_EXIT)"
+        echo "sarif-file=$SARIF_FILE" >> "$GITHUB_OUTPUT"
+        echo "finding-count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+        echo "exit-code=$FINAL_EXIT" >> "$GITHUB_OUTPUT"
+        echo "have-baseline=$HAVE_BASELINE" >> "$GITHUB_OUTPUT"
+
+        echo "Audit complete: $FINDING_COUNT findings (exit code $FINAL_EXIT)"
+
+        # Exit 2 (runtime error) fails this step; exit 1 (findings) is handled by Set check result
+        if [ "$AUDIT_EXIT" -eq 2 ]; then
+          exit 1
+        fi
 
     - name: Upload SARIF to GitHub Code Scanning
-      if: inputs.upload-sarif == 'true' && steps.audit.outputs.sarif-file != '' && always()
+      if: inputs.upload-sarif == 'true' && steps.audit.outputs.sarif-file != '' && !cancelled()
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: ${{ steps.audit.outputs.sarif-file }}
-        category: capsec-audit
+        category: ${{ inputs.sarif-category }}
       continue-on-error: true
 
     - name: Install reviewdog
-      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' && !cancelled()
       shell: bash
       run: |
+        if command -v reviewdog &>/dev/null; then
+          echo "reviewdog already installed"
+          exit 0
+        fi
         curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh | sh -s -- -b "${RUNNER_TEMP:-/tmp}/bin" "${{ inputs.reviewdog-version }}"
         echo "${RUNNER_TEMP:-/tmp}/bin" >> "$GITHUB_PATH"
 
     - name: Post PR review comments
-      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request'
+      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' && !cancelled()
       shell: bash
       env:
         REVIEWDOG_GITHUB_API_TOKEN: ${{ inputs.token }}
@@ -194,19 +243,25 @@ runs:
           exit 0
         fi
 
-        # Convert SARIF to reviewdog format and post
-        # reviewdog supports SARIF input natively via -f=sarif
+        # When diffing with a baseline and audit passed (exit 0), skip reviewdog
+        # to avoid annotating all baseline findings as PR comments
+        if [ "${{ steps.audit.outputs.have-baseline }}" = "true" ] && [ "${{ steps.audit.outputs.exit-code }}" = "0" ]; then
+          echo "Diff mode: no new findings — skipping PR annotations"
+          exit 0
+        fi
+
+        # Only annotate findings on lines changed in this PR
         cat "$SARIF_FILE" | reviewdog \
           -f=sarif \
           -name="capsec" \
           -reporter=github-pr-review \
-          -filter-mode=nofilter \
+          -filter-mode=diff_context \
           -fail-on-error=false \
           -level=warning
       continue-on-error: true
 
     - name: Set check result
-      if: always()
+      if: '!cancelled()'
       shell: bash
       run: |
         EXIT_CODE="${{ steps.audit.outputs.exit-code }}"
