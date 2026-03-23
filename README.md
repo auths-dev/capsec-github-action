@@ -38,7 +38,7 @@ jobs:
 | `working-directory` | `.` | Path to Cargo workspace root |
 | `token` | `${{ github.token }}` | GitHub token |
 | `install-from` | `crates-io` | Install method: `crates-io` or `git` |
-| `git-repo` | `https://github.com/bordumb/capsec` | Git URL when `install-from` is `git` |
+| `git-repo` | `https://github.com/auths-dev/capsec` | Git URL when `install-from` is `git` |
 
 ## Outputs
 

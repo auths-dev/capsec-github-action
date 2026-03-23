@@ -49,7 +49,7 @@ inputs:
     default: 'crates-io'
   git-repo:
     description: 'Git repository URL when install-from is "git"'
-    default: 'https://github.com/bordumb/capsec'
+    default: 'https://github.com/auths-dev/capsec'
 
 outputs:
   sarif-file:
